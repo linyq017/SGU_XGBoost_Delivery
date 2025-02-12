@@ -1,104 +1,81 @@
+from osgeo import gdal
 import os
-import glob
-import rasterio as rio
-from rasterio.mask import mask
-from shapely.geometry import box
-from rasterio.coords import BoundingBox
-import argparse
+from pathlib import Path
 
-def mask_raster_with_bounds(input_raster, reference_raster_folder, output_base_folder):
+def mask_with_bounds(mask_tif_path, source_tif_path, output_path):
     """
-    Masks a raster or all rasters in a folder using the bounds of a reference raster
-    and saves the clipped rasters with the same names in an output folder.
+    Mask a source TIF using the bounds of another TIF file.
     
     Args:
-        input_raster (str or list): A single raster file or a list of raster files to be masked.
-        reference_raster_folder (str): Folder containing the reference raster whose bounds will be used.
-        output_base_folder (str): Base folder where the output folder will be created.
-        
-    Returns:
-        None
+        mask_tif_path (str): Path to the TIF file whose bounds will be used as mask
+        source_tif_path (str): Path to the large TIF file to be masked
+        output_path (str): Path where the masked TIF will be saved
     """
-    # Ensure the input is a list of rasters (single raster or a folder of rasters)
-    if isinstance(input_raster, str):
-        # If a single raster, wrap it in a list
-        if os.path.isdir(input_raster):
-            # If input is a folder, get all rasters in that folder
-            input_raster_files = glob.glob(os.path.join(input_raster, '*.tif'))
-        else:
-            # If a single raster file, use it directly
-            input_raster_files = [input_raster]
-    elif isinstance(input_raster, list):
-        input_raster_files = input_raster
-    else:
-        raise ValueError("input_raster must be either a file path or a list of raster files.")
+    # Open the mask TIF to get its bounds
+    mask_ds = gdal.Open(mask_tif_path)
+    mask_geotransform = mask_ds.GetGeoTransform()
+    mask_minx = mask_geotransform[0]
+    mask_maxy = mask_geotransform[3]
+    mask_maxx = mask_minx + mask_geotransform[1] * mask_ds.RasterXSize
+    mask_miny = mask_maxy + mask_geotransform[5] * mask_ds.RasterYSize
+    
+    # Create the output directory if it doesn't exist
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    
+    # Construct the gdal_translate command to crop using bounds
+    gdal.Translate(
+        output_path,
+        source_tif_path,
+        projWin=[mask_minx, mask_maxy, mask_maxx, mask_miny],
+        format='GTiff'
+    )
 
-    # Get all raster files in the reference raster folder to extract the bounds
-    reference_raster_files = glob.glob(os.path.join(reference_raster_folder, '*.tif'))
+def process_multiple_sources(mask_folder, source_folder, base_output_folder):
+    """
+    Process multiple source TIFs, creating separate output folders for each source file.
     
-    if not reference_raster_files:
-        raise ValueError("No raster files found in the reference raster folder.")
+    Args:
+        mask_folder (str): Path to folder containing masking TIF files
+        source_folder (str): Path to folder containing source TIF files
+        base_output_folder (str): Base path where output folders will be created
+    """
+    # Get list of mask and source TIFs
+    mask_files = list(Path(mask_folder).glob('*.tif'))
+    source_files = list(Path(source_folder).glob('*.tif'))
     
-    # Use the first raster from the folder to get the bounds
-    with rio.open(reference_raster_files[0]) as ref_src:
-        bbox = ref_src.bounds  # Get the bounds of the reference raster
-        
-    # Convert the bounding box to a Shapely box (geometry) for masking
-    bounds = BoundingBox(left=bbox.left, bottom=bbox.bottom, right=bbox.right, top=bbox.top)
-    mask_geom = box(bounds.left, bounds.bottom, bounds.right, bounds.top)
+    if not mask_files:
+        print(f"No mask TIF files found in {mask_folder}")
+        return
     
-    # Process each input raster file
-    for input_raster_path in input_raster_files:
-        # Extract the input raster folder name for creating an output subfolder
-        input_raster_folder = os.path.basename(os.path.dirname(input_raster_path))
-        
-        # Create the output folder based on the input raster's folder name
-        output_folder = os.path.join(output_base_folder, input_raster_folder)
+    if not source_files:
+        print(f"No source TIF files found in {source_folder}")
+        return
+    
+    # Process each source TIF
+    for source_file in source_files:
+        # Create output folder for this source file
+        source_name = source_file.stem  # Get filename without extension
+        output_folder = os.path.join(base_output_folder, source_name)
         os.makedirs(output_folder, exist_ok=True)
         
-        print(f"Processing raster: {input_raster_path}")
+        print(f"\nProcessing source file: {source_file.name}")
+        print(f"Creating output folder: {output_folder}")
         
-        # Open the input raster
-        with rio.open(input_raster_path) as src:
-            # Mask the raster with the geometry (bounding box of the reference raster)
-            out_image, out_transform = mask(src, [mask_geom], crop=True)
+        # Process each mask for this source file
+        for mask_file in mask_files:
+            output_path = os.path.join(output_folder, mask_file.name)
+            
+            print(f"  Masking with {mask_file.name}...")
+            try:
+                mask_with_bounds(str(mask_file), str(source_file), output_path)
+                print(f"  Successfully created {output_path}")
+            except Exception as e:
+                print(f"  Error processing {mask_file.name}: {str(e)}")
 
-            # Copy metadata and update for single-band output
-            out_meta = src.meta.copy()
-            out_meta.update({
-                "driver": "GTiff",
-                "height": out_image.shape[1],  # Height of the masked region
-                "width": out_image.shape[2],   # Width of the masked region
-                "transform": out_transform,
-                "count": 1  # Force single-band output
-            })
-
-            # Define the output file path
-            output_path = os.path.join(output_folder, os.path.basename(input_raster_path))
-
-            # Write the masked raster (only the first band)
-            with rio.open(output_path, 'w', **out_meta) as dst:
-                dst.write(out_image[0], 1)  # Extract and write only the first band
-
-
-def main():
-    # Parse command-line arguments
-    parser = argparse.ArgumentParser(description="Mask raster(s) with the bounds of a reference raster.")
-    
-    # Command-line arguments
-    parser.add_argument('input_raster', type=str, help="Path to a single raster or a folder of rasters")
-    parser.add_argument('reference_raster_folder', type=str, help="Folder containing the reference raster")
-    parser.add_argument('output_base_folder', type=str, help="Base folder where output rasters will be saved")
-    
-    # Parse the arguments
-    args = parser.parse_args()
-    
-    # Call the function to mask rasters
-    mask_raster_with_bounds(args.input_raster, args.reference_raster_folder, args.output_base_folder)
-
+# Example usage
 if __name__ == "__main__":
-    mask_raster_with_bounds(
-        input_raster="/workspace/data/wbt/New_Indices",
-        reference_raster_folder="/workspace/data/SGU/orginal_fran_wl/CompositeBands",
-        output_base_folder="/workspace/data/wbt/New_Indices_Tiles"
-    )
+    mask_folder = "/workspace/data/soildepth/Indices/Indices_Tiles/Aspect20_resample"      # Folder containing TIF files to use as masks
+    source_folder = "/workspace/data/soildepth/Indices/Mosaic_Resampled/OneHot"  # Folder containing large TIF files to be masked
+    base_output_folder = "/workspace/data/soildepth/Indices/Indices_Tiles"    # Base folder where output folders will be created
+    
+    process_multiple_sources(mask_folder, source_folder, base_output_folder)
